@@ -1,3 +1,4 @@
+import hmac
 import json
 
 import requests
@@ -6,10 +7,12 @@ import streamlit.components.v1 as components
 
 
 POSTCODE_API = "https://api.postcodes.io/postcodes"
-ZOHO_TOKEN_ERRORS = {
-    "invalid_client": "Check the Client ID and the Zoho data centre.",
-    "invalid_client_secret": "Check the Client Secret for the same Zoho Self Client.",
-    "invalid_code": "Check that you saved the current refresh_token from the token exchange.",
+DEFAULT_ZOHO_ACCOUNTS_URL = "https://accounts.zoho.eu"
+
+ZOHO_ERRORS = {
+    "invalid_client": "Check the Client ID and Zoho data centre.",
+    "invalid_client_secret": "Check the Client Secret for this Self Client.",
+    "invalid_code": "Zoho rejected the code or refresh token.",
     "access_denied": "Check that the Zoho user has authorised this client.",
 }
 
@@ -18,47 +21,121 @@ def normalise_postcode(value):
     return "".join(str(value or "").upper().split())
 
 
+def request_zoho_token(config, grant_type, credential_name, credential):
+    accounts_url = config.get("accounts_url", DEFAULT_ZOHO_ACCOUNTS_URL)
+    response = requests.post(
+        f"{accounts_url.strip().rstrip('/')}/oauth/v2/token",
+        data={
+            "grant_type": grant_type,
+            "client_id": config["client_id"].strip(),
+            "client_secret": config["client_secret"].strip(),
+            credential_name: credential.strip(),
+        },
+        timeout=20,
+        allow_redirects=False,
+    )
+
+    try:
+        result = response.json()
+    except ValueError:
+        result = {}
+
+    if isinstance(result, dict) and response.ok and result.get("access_token"):
+        return result
+
+    error = result.get("error") if isinstance(result, dict) else None
+    if isinstance(error, str) and error in ZOHO_ERRORS:
+        if error == "invalid_code":
+            if grant_type == "authorization_code":
+                raise RuntimeError(
+                    "Zoho token exchange failed: invalid_code. Generate a fresh "
+                    "authorisation code in the same Self Client and submit it "
+                    "before it expires."
+                )
+            raise RuntimeError(
+                "Zoho token refresh failed: invalid_code. Use Zoho token setup "
+                "to generate a replacement refresh token."
+            )
+        raise RuntimeError(f"Zoho token request failed: {error}. {ZOHO_ERRORS[error]}")
+
+    raise RuntimeError(
+        f"Zoho token request failed (HTTP {response.status_code}). "
+        "Check the Zoho Accounts URL and try again."
+    )
+
+
+def show_zoho_token_setup(config):
+    setup_password = config.get("setup_password", "")
+    if not isinstance(setup_password, str) or not setup_password:
+        return
+
+    with st.expander("Zoho token setup"):
+        st.caption(
+            "In the same Zoho Self Client, generate a fresh authorisation code "
+            "with the scope ZohoCRM.modules.accounts.READ."
+        )
+
+        with st.form("zoho_token_setup", clear_on_submit=True):
+            password = st.text_input("Setup password", type="password")
+            grant_code = st.text_input("Zoho authorisation code", type="password")
+            submitted = st.form_submit_button("Generate refresh token")
+
+        if not submitted:
+            return
+
+        if not hmac.compare_digest(password.encode(), setup_password.encode()):
+            st.error("The setup password is incorrect.")
+            return
+
+        if not grant_code.strip():
+            st.error("Enter a fresh Zoho authorisation code.")
+            return
+
+        try:
+            token = request_zoho_token(
+                config, "authorization_code", "code", grant_code
+            )
+        except KeyError:
+            st.error("Add client_id and client_secret under [zoho] in Streamlit Secrets.")
+            return
+        except RuntimeError as error:
+            st.error(str(error))
+            return
+        except requests.RequestException:
+            st.error("Could not reach Zoho. Check the Accounts URL and try a fresh code.")
+            return
+
+        refresh_token = token.get("refresh_token")
+        if not isinstance(refresh_token, str) or not refresh_token:
+            st.error("Zoho accepted the code but did not return a refresh token.")
+            return
+
+        st.success("Copy this line into [zoho] in Streamlit Secrets, replacing the old line.")
+        st.code(f"refresh_token = {json.dumps(refresh_token)}", language="toml")
+
+
 @st.cache_data(ttl=600, show_spinner=False)
 def load_accounts():
     config = st.secrets["zoho"]
-    accounts_url = config.get("accounts_url", "https://accounts.zoho.eu")
-    token_url = f"{accounts_url.rstrip('/')}/oauth/v2/token"
+    refresh_token = config.get("refresh_token", "").strip()
+    if not refresh_token:
+        raise RuntimeError("Save a refresh_token under [zoho] in Streamlit Secrets.")
+
+    token = request_zoho_token(
+        config, "refresh_token", "refresh_token", refresh_token
+    )
+    api_domain = token.get("api_domain")
+    if not api_domain:
+        raise RuntimeError("Zoho did not return the CRM API domain.")
+
+    api_url = f"{api_domain.rstrip('/')}/crm/v8/Accounts"
+    params = {"fields": "Account_Name,Post_Code", "per_page": 200}
+    records = {}
+    page = 1
+    seen_page_tokens = set()
 
     with requests.Session() as session:
-        response = session.post(
-            token_url,
-            data={
-                "grant_type": "refresh_token",
-                "client_id": config["client_id"].strip(),
-                "client_secret": config["client_secret"].strip(),
-                "refresh_token": config["refresh_token"].strip(),
-            },
-            timeout=20,
-        )
-
-        try:
-            token = response.json()
-        except ValueError:
-            token = {}
-
-        if not response.ok or not token.get("access_token"):
-            code = token.get("error")
-            if not isinstance(code, str) or code not in ZOHO_TOKEN_ERRORS:
-                raise RuntimeError(
-                    f"Zoho token refresh failed: unknown_error (HTTP {response.status_code})."
-                )
-            raise RuntimeError(
-                f"Zoho token refresh failed: {code}. {ZOHO_TOKEN_ERRORS[code]}"
-            )
-
-        session.headers["Authorization"] = (
-            f"Zoho-oauthtoken {token['access_token']}"
-        )
-        api_url = f"{token['api_domain'].rstrip('/')}/crm/v8/Accounts"
-        params = {"fields": "Account_Name,Post_Code", "per_page": 200}
-        records = {}
-        page = 1
-        seen_page_tokens = set()
+        session.headers["Authorization"] = f"Zoho-oauthtoken {token['access_token']}"
 
         while True:
             response = session.get(api_url, params=params, timeout=30)
@@ -66,15 +143,16 @@ def load_accounts():
                 break
             if response.status_code in (401, 403):
                 raise RuntimeError(
-                    "Zoho accepted the credentials but denied access to Accounts. "
+                    "Zoho issued an access token but denied access to Accounts. "
                     "Check the Accounts read scope and the Zoho user's permissions."
                 )
             response.raise_for_status()
             payload = response.json()
 
             for record in payload["data"]:
-                records[record["id"]] = {
-                    "id": record["id"],
+                record_id = record["id"]
+                records[record_id] = {
+                    "id": record_id,
                     "name": record.get("Account_Name") or "Unnamed account",
                     "postcode": normalise_postcode(record.get("Post_Code")),
                 }
@@ -125,83 +203,6 @@ def lookup_postcodes(postcodes):
     return locations
 
 
-st.set_page_config(page_title="SY Comms CRM Map", layout="wide")
-st.title("SY Comms CRM Map")
-
-if st.button("Refresh Zoho accounts"):
-    load_accounts.clear()
-
-accounts = None
-pins = []
-
-try:
-    with st.spinner("Reading Zoho Accounts…"):
-        accounts = load_accounts()
-except RuntimeError as error:
-    st.error(str(error))
-except FileNotFoundError:
-    st.error("Add the [zoho] section in Streamlit App settings → Secrets.")
-except KeyError:
-    st.error(
-        "Check that all three settings are present under [zoho] in Streamlit Secrets. "
-        "If they are present, Zoho returned an unexpected response."
-    )
-except (requests.RequestException, ValueError):
-    st.error("The Zoho request failed. Click Refresh Zoho accounts to try again.")
-
-if accounts is not None:
-    mode = st.radio(
-        "Show on map",
-        ["Select accounts", "All accounts"],
-        horizontal=True,
-    )
-
-    if mode == "Select accounts":
-        by_id = {account["id"]: account for account in accounts}
-        labels = {
-            account["id"]: f"{account['name']} ({account['postcode'] or 'no postcode'})"
-            for account in accounts
-        }
-        chosen = st.multiselect(
-            "Choose accounts",
-            list(by_id),
-            format_func=labels.get,
-        )
-        selected = [by_id[account_id] for account_id in chosen]
-    else:
-        selected = accounts
-
-    postcodes = sorted({
-        account["postcode"] for account in selected if account["postcode"]
-    })
-    missing = sum(not account["postcode"] for account in selected)
-
-    try:
-        with st.spinner("Looking up account postcodes…"):
-            locations = lookup_postcodes(postcodes)
-
-        pins = [
-            {"name": account["name"], **locations[account["postcode"]]}
-            for account in selected
-            if account["postcode"] in locations
-        ]
-        not_found = len(selected) - missing - len(pins)
-        st.caption(
-            f"{len(accounts):,} read from Zoho · {len(selected):,} selected · "
-            f"{len(pins):,} accounts mapped · {missing:,} missing postcode · "
-            f"{not_found:,} postcode not found"
-        )
-    except (requests.RequestException, ValueError, KeyError, TypeError):
-        st.error("The account postcode lookup failed. Reload the page to try again.")
-
-# Prevent CRM text from breaking out of the HTML script element.
-pins_json = (
-    json.dumps(pins)
-    .replace("<", "\\u003c")
-    .replace(">", "\\u003e")
-    .replace("&", "\\u0026")
-)
-
 MAP_HTML = r"""
 <!doctype html>
 <html lang="en">
@@ -236,7 +237,7 @@ MAP_HTML = r"""
     const statusMessage = document.querySelector('#status');
 
     if (typeof L === 'undefined') {
-      statusMessage.textContent = 'The map could not load. Refresh the page to try again.';
+      statusMessage.textContent = 'The map could not load. Refresh the page to retry.';
       button.disabled = true;
     } else {
       initialiseMap();
@@ -337,4 +338,76 @@ MAP_HTML = r"""
 </html>
 """
 
+
+st.set_page_config(page_title="SY Comms CRM Map", layout="wide")
+st.title("SY Comms CRM Map")
+
+try:
+    zoho_config = st.secrets["zoho"]
+except (FileNotFoundError, KeyError):
+    zoho_config = None
+    st.error("Add the [zoho] section in Streamlit App settings → Secrets.")
+
+accounts = None
+pins = []
+
+if zoho_config is not None:
+    show_zoho_token_setup(zoho_config)
+
+    if st.button("Refresh Zoho accounts"):
+        load_accounts.clear()
+
+    try:
+        with st.spinner("Reading Zoho Accounts…"):
+            accounts = load_accounts()
+    except RuntimeError as error:
+        st.error(str(error))
+    except KeyError:
+        st.error("Check the [zoho] settings. A required setting or Zoho response field is missing.")
+    except (requests.RequestException, ValueError):
+        st.error("The Zoho request failed. Click Refresh Zoho accounts to try again.")
+
+if accounts is not None:
+    mode = st.radio("Show on map", ["Select accounts", "All accounts"], horizontal=True)
+
+    if mode == "Select accounts":
+        by_id = {account["id"]: account for account in accounts}
+        labels = {
+            account["id"]: f"{account['name']} ({account['postcode'] or 'no postcode'})"
+            for account in accounts
+        }
+        chosen = st.multiselect("Choose accounts", list(by_id), format_func=labels.get)
+        selected = [by_id[account_id] for account_id in chosen]
+    else:
+        selected = accounts
+
+    postcodes = sorted({
+        account["postcode"] for account in selected if account["postcode"]
+    })
+    missing = sum(not account["postcode"] for account in selected)
+
+    try:
+        with st.spinner("Looking up account postcodes…"):
+            locations = lookup_postcodes(postcodes)
+
+        pins = [
+            {"name": account["name"], **locations[account["postcode"]]}
+            for account in selected
+            if account["postcode"] in locations
+        ]
+        not_found = len(selected) - missing - len(pins)
+        st.caption(
+            f"{len(accounts):,} read from Zoho · {len(selected):,} selected · "
+            f"{len(pins):,} accounts mapped · {missing:,} missing postcode · "
+            f"{not_found:,} postcode not found"
+        )
+    except (requests.RequestException, ValueError, KeyError, TypeError):
+        st.error("The account postcode lookup failed. Reload the page to try again.")
+
+pins_json = (
+    json.dumps(pins)
+    .replace("<", "\\u003c")
+    .replace(">", "\\u003e")
+    .replace("&", "\\u0026")
+)
 components.html(MAP_HTML.replace("__ACCOUNT_PINS__", pins_json), height=650)
