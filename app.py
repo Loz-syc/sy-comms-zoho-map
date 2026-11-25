@@ -1,22 +1,22 @@
 import hmac
 import json
+import math
+from collections import Counter
 
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
 
 
-POSTCODE_API = "https://api.postcodes.io/postcodes"
-DEFAULT_ZOHO_ACCOUNTS_URL = "https://accounts.zoho.eu"
 MODULES = ("Accounts", "Leads", "Deals")
-SCOPES = ",".join(
-    f"ZohoCRM.modules.{module.lower()}.READ" for module in MODULES
-)
-
-ZOHO_ERRORS = {
+SCOPES = ",".join(f"ZohoCRM.modules.{module.lower()}.READ" for module in MODULES)
+GB_COUNTRIES = ("England", "Scotland", "Wales")
+POSTCODE_API = "https://api.postcodes.io/postcodes"
+DEFAULT_ACCOUNTS_URL = "https://accounts.zoho.eu"
+TOKEN_ERRORS = {
     "invalid_client": "Check the Client ID and Zoho data centre.",
     "invalid_client_secret": "Check the Client Secret for this Self Client.",
-    "access_denied": "Check that your Zoho user has authorised this client.",
+    "access_denied": "Check that your Zoho user authorised this client.",
 }
 
 
@@ -24,13 +24,13 @@ def normalise_postcode(value):
     return "".join(str(value or "").upper().split())
 
 
-def field_label(value, fallback):
+def field_label(value, fallback="Not set"):
     return str(value or "").strip() or fallback
 
 
 def script_json(value):
     return (
-        json.dumps(value)
+        json.dumps(value, allow_nan=False)
         .replace("<", "\\u003c")
         .replace(">", "\\u003e")
         .replace("&", "\\u0026")
@@ -38,16 +38,17 @@ def script_json(value):
 
 
 def request_zoho_token(config, grant_type, credential):
-    accounts_url = config.get("accounts_url", DEFAULT_ZOHO_ACCOUNTS_URL)
-    credential_key = "code" if grant_type == "authorization_code" else "refresh_token"
-
+    accounts_url = config.get("accounts_url", DEFAULT_ACCOUNTS_URL).strip().rstrip("/")
+    credential_field = (
+        "code" if grant_type == "authorization_code" else "refresh_token"
+    )
     response = requests.post(
-        f"{accounts_url.strip().rstrip('/')}/oauth/v2/token",
+        f"{accounts_url}/oauth/v2/token",
         data={
             "grant_type": grant_type,
             "client_id": config["client_id"].strip(),
             "client_secret": config["client_secret"].strip(),
-            credential_key: credential.strip(),
+            credential_field: credential.strip(),
         },
         timeout=20,
         allow_redirects=False,
@@ -58,34 +59,34 @@ def request_zoho_token(config, grant_type, credential):
     except ValueError:
         result = {}
 
-    if isinstance(result, dict) and response.ok and result.get("access_token"):
+    if not isinstance(result, dict):
+        result = {}
+    if response.status_code == 200 and result.get("access_token"):
         return result
 
-    error = result.get("error") if isinstance(result, dict) else None
+    error = result.get("error")
     if error == "invalid_code":
         if grant_type == "authorization_code":
             raise RuntimeError(
                 "Zoho token exchange failed: invalid_code. Generate a fresh "
-                "authorisation code in this Self Client and submit it before it expires."
+                "authorisation code in the same Self Client."
             )
         raise RuntimeError(
-            "Zoho token refresh failed: invalid_code. Generate a replacement "
-            "refresh token using Zoho token setup."
+            "Zoho token refresh failed: invalid_code. Use Zoho token setup "
+            "to generate a replacement refresh token."
         )
-
-    if isinstance(error, str) and error in ZOHO_ERRORS:
-        raise RuntimeError(f"Zoho token request failed: {error}. {ZOHO_ERRORS[error]}")
-
+    if isinstance(error, str) and error in TOKEN_ERRORS:
+        raise RuntimeError(f"Zoho token request failed: {error}. {TOKEN_ERRORS[error]}")
     raise RuntimeError(f"Zoho token request failed (HTTP {response.status_code}).")
 
 
-def show_zoho_token_setup(config):
+def show_token_setup(config):
     setup_password = config.get("setup_password", "")
     if not isinstance(setup_password, str) or not setup_password:
         return
 
     with st.expander("Zoho token setup"):
-        st.caption("Generate a fresh authorisation code in the same Zoho Self Client with these scopes.")
+        st.caption("Generate a fresh authorisation code in your Zoho Self Client.")
         st.code(SCOPES, language="text")
 
         with st.form("zoho_token_setup", clear_on_submit=True):
@@ -95,11 +96,9 @@ def show_zoho_token_setup(config):
 
         if not submitted:
             return
-
         if not hmac.compare_digest(password.encode(), setup_password.encode()):
             st.error("The setup password is incorrect.")
             return
-
         if not grant_code.strip():
             st.error("Enter a fresh Zoho authorisation code.")
             return
@@ -118,7 +117,7 @@ def show_zoho_token_setup(config):
 
         refresh_token = token.get("refresh_token")
         if not isinstance(refresh_token, str) or not refresh_token:
-            st.error("Zoho accepted the code but did not return a refresh token.")
+            st.error("Zoho did not return a refresh token.")
             return
 
         st.success("Replace the refresh_token line under [zoho] in Streamlit Secrets.")
@@ -134,20 +133,17 @@ def read_module(session, api_domain, module, fields):
 
     while True:
         response = session.get(url, params=params, timeout=30, allow_redirects=False)
-
         if response.status_code == 204:
             break
-
         if response.status_code in (401, 403):
             raise RuntimeError(
-                f"Zoho denied access to {module}. Check the module's read scope "
-                "and the connected user's Zoho permissions."
+                f"Zoho denied access to {module}. Check the read scope "
+                "and the connected user's module permissions."
             )
-
         if response.status_code != 200:
             raise RuntimeError(
                 f"Zoho could not load {module} (HTTP {response.status_code}). "
-                "Check the configured field API names and try again."
+                "Check the configured field API names."
             )
 
         payload = response.json()
@@ -189,9 +185,9 @@ def load_map_records(modules):
     account_postcode_field = config.get("account_postcode_field", "Post_Code")
     account_type_field = config.get("account_type_field", "Account_Type")
     lead_postcode_field = config.get("lead_postcode_field", "Zip_Code")
-    deal_type_field = config.get("deal_type_field", "Type")
+    deal_type_field = config.get("deal_type_field", "Deal_Type")
 
-    fields_by_module = {
+    fields = {
         "Accounts": ("Account_Name", account_postcode_field, account_type_field),
         "Leads": ("Full_Name", "Company", lead_postcode_field),
         "Deals": ("Deal_Name", "Stage", "Account_Name", deal_type_field),
@@ -203,18 +199,14 @@ def load_map_records(modules):
 
     raw = {}
     errors = []
-
     with requests.Session() as session:
         session.headers["Authorization"] = f"Zoho-oauthtoken {token['access_token']}"
 
         for module in MODULES:
             if module not in requested:
                 continue
-
             try:
-                raw[module] = read_module(
-                    session, api_domain, module, fields_by_module[module]
-                )
+                raw[module] = read_module(session, api_domain, module, fields[module])
             except RuntimeError as error:
                 errors.append(str(error))
             except (requests.RequestException, ValueError, KeyError, TypeError):
@@ -222,12 +214,11 @@ def load_map_records(modules):
 
     records = []
     account_postcodes = {}
-
     for account in raw.get("Accounts", []):
         postcode = normalise_postcode(account.get(account_postcode_field))
         account_postcodes[account["id"]] = postcode
         if "Accounts" in modules:
-            account_type = field_label(account.get(account_type_field), "Not set")
+            account_type = field_label(account.get(account_type_field))
             records.append({
                 "id": f"Accounts:{account['id']}",
                 "module": "Accounts",
@@ -249,10 +240,10 @@ def load_map_records(modules):
         })
 
     for deal in raw.get("Deals", []):
-        linked_account = deal.get("Account_Name")
-        account = linked_account if isinstance(linked_account, dict) else {}
-        stage = field_label(deal.get("Stage"), "Not set")
-        deal_type = field_label(deal.get(deal_type_field), "Not set")
+        linked = deal.get("Account_Name")
+        account = linked if isinstance(linked, dict) else {}
+        stage = field_label(deal.get("Stage"))
+        deal_type = field_label(deal.get(deal_type_field))
         details = [f"Stage: {stage}", f"Deal type: {deal_type}"]
         if account.get("name"):
             details.insert(0, account["name"])
@@ -274,6 +265,7 @@ def load_map_records(modules):
 @st.cache_data(ttl=86400, show_spinner=False)
 def lookup_postcodes(postcodes):
     locations = {}
+    outside_gb = set()
 
     for start in range(0, len(postcodes), 100):
         response = requests.post(
@@ -288,15 +280,24 @@ def lookup_postcodes(postcodes):
             if not result:
                 continue
 
+            query = normalise_postcode(match["query"])
+            if result.get("country") not in GB_COUNTRIES:
+                outside_gb.add(query)
+                continue
+
             latitude = result.get("latitude")
             longitude = result.get("longitude")
-            if latitude is not None and longitude is not None:
-                locations[normalise_postcode(match["query"])] = {
-                    "postcode": result["postcode"],
-                    "location": [latitude, longitude],
-                }
+            if latitude is None or longitude is None:
+                continue
+            if not math.isfinite(latitude) or not math.isfinite(longitude):
+                continue
 
-    return locations
+            locations[query] = {
+                "postcode": result["postcode"],
+                "location": [latitude, longitude],
+            }
+
+    return locations, outside_gb
 
 
 def choose_filter(records, module, field, label, placeholder):
@@ -318,8 +319,9 @@ MAP_HTML = r"""
   <style>
     body { margin: 0; font: 16px Arial, sans-serif; }
     form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-    input, button { font: inherit; padding: 8px 12px; }
-    input { width: 10rem; }
+    #postcode, button { font: inherit; padding: 8px 12px; }
+    #postcode { width: 10rem; }
+    button { cursor: pointer; }
     #status { min-height: 1.25em; margin: 8px 0; }
     #map { height: 520px; border-radius: 12px; }
     .layer-dot {
@@ -333,33 +335,65 @@ MAP_HTML = r"""
 </head>
 <body>
   <form id="postcode-form">
-    <label for="postcode">UK postcode</label>
-    <input id="postcode" placeholder="SW1A 1AA" maxlength="12" required>
-    <button type="submit">Find postcode</button>
+    <label for="postcode">Postcode or prefix</label>
+    <input id="postcode" placeholder="TF or TF1 1AA" maxlength="12"
+           autocomplete="off" spellcheck="false">
+    <button type="submit">Search</button>
+    <button type="button" id="clear-postcode">Clear</button>
   </form>
   <p id="status" role="status"></p>
-  <div id="map" aria-label="Map of Zoho CRM records"></div>
+  <div id="map" aria-label="Map of Zoho CRM records in Great Britain"></div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
-    const pins = __CRM_PINS__;
-    const activeModules = __CRM_MODULES__;
+    const { pins, modules, countries, postcodeApi } = __CRM_DATA__;
+    const gbCountries = new Set(countries);
     const form = document.querySelector('#postcode-form');
     const input = document.querySelector('#postcode');
-    const button = form.querySelector('button');
+    const searchButton = form.querySelector('button[type="submit"]');
+    const clearButton = document.querySelector('#clear-postcode');
     const statusMessage = document.querySelector('#status');
 
     if (typeof L === 'undefined') {
       statusMessage.textContent = 'The map could not load. Refresh the page to retry.';
-      button.disabled = true;
+      searchButton.disabled = true;
+      clearButton.disabled = true;
     } else {
       initialiseMap();
     }
 
+    function normalisePostcode(value) {
+      return value.toUpperCase().replace(/\s+/g, '');
+    }
+
+    function buildPopup(module, records) {
+      const popup = document.createElement('div');
+      const heading = document.createElement('strong');
+      heading.textContent = module;
+      popup.append(heading);
+
+      const list = document.createElement('ul');
+      for (const record of records) {
+        const item = document.createElement('li');
+        item.textContent = [record.name, record.postcode, record.detail]
+          .filter(Boolean).join(' · ');
+        list.append(item);
+      }
+      popup.append(list);
+      return popup;
+    }
+
     function initialiseMap() {
-      const map = L.map('map').setView([54.2, -2.9], 6);
+      const gbBounds = L.latLngBounds([49.8, -8.8], [61.0, 2.1]);
+      const map = L.map('map', {
+        maxBounds: gbBounds,
+        maxBoundsViscosity: 1,
+        minZoom: 4
+      }).fitBounds(gbBounds);
+
       L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
         maxZoom: 19,
+        noWrap: true,
         attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
       }).addTo(map);
 
@@ -368,17 +402,17 @@ MAP_HTML = r"""
         Leads: { colour: '#15803d', radius: 12 },
         Deals: { colour: '#c2410c', radius: 17 }
       };
-
-      const layers = {};
+      const layers = new Map();
       const overlays = {};
-      for (const module of activeModules) {
-        layers[module] = L.layerGroup().addTo(map);
+
+      for (const module of modules) {
+        const layer = L.layerGroup().addTo(map);
+        layers.set(module, layer);
         const colour = styles[module].colour;
         const label = `<span class="layer-dot" style="background:${colour}"></span>${module}`;
-        overlays[label] = layers[module];
+        overlays[label] = layer;
       }
 
-      // Group records by coordinates and module so shared locations stay clickable.
       const locations = new Map();
       for (const pin of pins) {
         const key = JSON.stringify(pin.location);
@@ -388,67 +422,126 @@ MAP_HTML = r"""
         groups.get(pin.module).push(pin);
       }
 
-      const bounds = L.latLngBounds([]);
+      const crmMarkers = [];
       for (const groups of locations.values()) {
         const shared = groups.size > 1;
-
         for (const [module, records] of groups) {
-          const location = records[0].location;
           const style = styles[module];
-
-          const popup = document.createElement('div');
-          const heading = document.createElement('strong');
-          heading.textContent = module;
-          popup.append(heading);
-
-          const list = document.createElement('ul');
-          for (const record of records) {
-            const item = document.createElement('li');
-            item.textContent = [record.name, record.postcode, record.detail]
-              .filter(Boolean).join(' · ');
-            list.append(item);
-          }
-          popup.append(list);
-
-          L.circleMarker(location, {
+          const marker = L.circleMarker(records[0].location, {
             radius: shared ? style.radius : 8,
             color: style.colour,
             fillColor: style.colour,
             fill: !shared,
             fillOpacity: 0.65,
             weight: 3
-          }).bindPopup(popup, { maxHeight: 240 }).addTo(layers[module]);
+          }).bindPopup(buildPopup(module, records), { maxHeight: 240 });
 
-          bounds.extend(location);
+          crmMarkers.push({ marker, module, records, layer: layers.get(module) });
         }
       }
 
-      if (activeModules.length) {
+      if (modules.length) {
         L.control.layers({}, overlays, { collapsed: false }).addTo(map);
       }
-      if (bounds.isValid()) {
-        map.fitBounds(bounds, { padding: [35, 35], maxZoom: 14 });
+
+      let activePrefix = '';
+      let postcodePin;
+
+      function showCrmMarkers(prefix) {
+        const bounds = L.latLngBounds([]);
+        let count = 0;
+
+        for (const { marker, module, records, layer } of crmMarkers) {
+          const matches = prefix
+            ? records.filter(record => normalisePostcode(record.postcode).startsWith(prefix))
+            : records;
+
+          if (!matches.length) {
+            layer.removeLayer(marker);
+            continue;
+          }
+
+          marker.setPopupContent(buildPopup(module, matches));
+          if (!layer.hasLayer(marker)) layer.addLayer(marker);
+
+          if (map.hasLayer(layer)) {
+            bounds.extend(marker.getLatLng());
+            count += matches.length;
+          }
+        }
+
+        return { bounds, count };
       }
 
-      let postcodePin;
+      function fitRecords(bounds) {
+        map.fitBounds(bounds.isValid() ? bounds : gbBounds, {
+          padding: [35, 35], maxZoom: 14
+        });
+      }
+
+      function describePrefix(count) {
+        statusMessage.textContent = count
+          ? `${count} visible CRM record${count === 1 ? '' : 's'} with postcodes starting ${activePrefix}.`
+          : `No visible CRM records have postcodes starting ${activePrefix}.`;
+      }
+
+      function removePostcodePin() {
+        if (postcodePin) postcodePin.remove();
+        postcodePin = undefined;
+      }
+
+      function clearPostcodeSearch() {
+        input.value = '';
+        activePrefix = '';
+        removePostcodePin();
+        statusMessage.textContent = '';
+        fitRecords(showCrmMarkers('').bounds);
+      }
+
+      fitRecords(showCrmMarkers('').bounds);
+
+      map.on('overlayadd overlayremove', () => {
+        if (activePrefix) describePrefix(showCrmMarkers(activePrefix).count);
+      });
+
+      clearButton.addEventListener('click', clearPostcodeSearch);
+
       form.addEventListener('submit', async (event) => {
         event.preventDefault();
-        if (button.disabled) return;
+        if (searchButton.disabled) return;
 
-        const postcode = input.value.toUpperCase().replace(/\s+/g, '');
+        const postcode = normalisePostcode(input.value);
         if (!postcode) {
-          statusMessage.textContent = 'Enter a UK postcode.';
+          clearPostcodeSearch();
           return;
         }
 
-        button.disabled = true;
+        const isFullPostcode =
+          postcode === 'GIR0AA' || /^[A-Z]{1,2}\d[A-Z\d]?\d[A-Z]{2}$/.test(postcode);
+
+        if (!isFullPostcode) {
+          if (!/^[A-Z]{1,2}(?:\d[A-Z\d]?)?$/.test(postcode)) {
+            statusMessage.textContent = 'Enter a prefix such as TF or a full postcode.';
+            return;
+          }
+
+          removePostcodePin();
+          activePrefix = postcode;
+          const { bounds, count } = showCrmMarkers(activePrefix);
+          if (bounds.isValid()) fitRecords(bounds);
+          describePrefix(count);
+          return;
+        }
+
+        searchButton.disabled = true;
+        clearButton.disabled = true;
         statusMessage.textContent = 'Looking up postcode…';
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), 10000);
 
         try {
           const response = await fetch(
-            'https://api.postcodes.io/postcodes/' + encodeURIComponent(postcode),
+            `${postcodeApi}/${encodeURIComponent(postcode)}`,
             { signal: controller.signal }
           );
           if (response.status === 400 || response.status === 404) {
@@ -458,24 +551,33 @@ MAP_HTML = r"""
           if (!response.ok) throw new Error('Lookup failed');
 
           const { result } = await response.json();
-          const location = [result?.latitude, result?.longitude];
+          if (!gbCountries.has(result?.country)) {
+            statusMessage.textContent = 'Enter a postcode in England, Scotland or Wales.';
+            return;
+          }
+
+          const location = [result.latitude, result.longitude];
           if (!location.every(Number.isFinite)) throw new Error('Missing coordinates');
+
+          activePrefix = '';
+          showCrmMarkers('');
+          removePostcodePin();
 
           const popup = document.createElement('span');
           popup.textContent = result.postcode;
-          if (postcodePin) postcodePin.remove();
-
           map.setView(location, 14);
           postcodePin = L.circleMarker(location, {
             radius: 10,
             color: '#7c3aed'
           }).addTo(map).bindPopup(popup).openPopup();
-          statusMessage.textContent = 'Showing ' + result.postcode;
+
+          statusMessage.textContent = `Showing ${result.postcode}.`;
         } catch {
           statusMessage.textContent = 'The postcode lookup is unavailable. Try again shortly.';
         } finally {
           clearTimeout(timer);
-          button.disabled = false;
+          searchButton.disabled = false;
+          clearButton.disabled = false;
         }
       });
     }
@@ -496,14 +598,14 @@ try:
 except (FileNotFoundError, KeyError):
     st.error("Add the [zoho] section in Streamlit → App settings → Secrets.")
 else:
-    show_zoho_token_setup(config)
+    show_token_setup(config)
 
     if st.button("Refresh Zoho records"):
         load_map_records.clear()
 
     modules = st.multiselect("Map layers", MODULES, default=["Accounts"])
-
     records = []
+
     if modules:
         try:
             with st.spinner("Reading Zoho records…"):
@@ -561,9 +663,7 @@ else:
                 for record_id, record in by_id.items()
             }
             chosen = st.multiselect(
-                "Search and select records",
-                list(by_id),
-                format_func=labels.get,
+                "Search and select records", list(by_id), format_func=labels.get
             )
             selected = [by_id[record_id] for record_id in chosen if record_id in by_id]
 
@@ -573,7 +673,7 @@ else:
 
         try:
             with st.spinner("Looking up postcodes…"):
-                locations = lookup_postcodes(postcodes)
+                locations, outside_gb = lookup_postcodes(postcodes)
 
             pins = [
                 {
@@ -586,23 +686,30 @@ else:
                 if record["postcode"] in locations
             ]
 
+            mapped_counts = Counter(pin["module"] for pin in pins)
             for module in modules:
                 layer_records = [
                     record for record in selected if record["module"] == module
                 ]
-                mapped = sum(pin["module"] == module for pin in pins)
+                mapped = mapped_counts[module]
                 missing = sum(not record["postcode"] for record in layer_records)
-                unmatched = len(layer_records) - mapped - missing
+                outside = sum(record["postcode"] in outside_gb for record in layer_records)
+                unmatched = len(layer_records) - mapped - missing - outside
                 missing_label = (
                     "no linked Account postcode" if module == "Deals" else "no postcode"
                 )
                 st.caption(
                     f"{module} · {mapped:,} mapped · {missing:,} {missing_label} · "
-                    f"{unmatched:,} postcode not found"
+                    f"{outside:,} outside Great Britain · {unmatched:,} postcode not found"
                 )
         except (requests.RequestException, ValueError, KeyError, TypeError):
             st.error("The postcode lookup failed. Refresh the page to retry.")
 
-html = MAP_HTML.replace("__CRM_MODULES__", script_json(modules), 1)
-html = html.replace("__CRM_PINS__", script_json(pins), 1)
+map_data = {
+    "pins": pins,
+    "modules": modules,
+    "countries": GB_COUNTRIES,
+    "postcodeApi": POSTCODE_API,
+}
+html = MAP_HTML.replace("__CRM_DATA__", script_json(map_data), 1)
 components.html(html, height=650)
