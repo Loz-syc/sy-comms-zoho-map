@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SY Comms CRM Map</title>
+  <link rel="stylesheet"
+        href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    body { margin: 24px; font-family: Arial, sans-serif; color: #202035; }
+    #map { height: 70vh; min-height: 320px; border-radius: 12px; }
+  </style>
+</head>
+<body>
+  <h1>SY Comms CRM Map</h1>
+  <p>Sample data. Click a pin to see its details.</p>
+  <div id="map" aria-label="Map of sample CRM records"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const map = L.map('map');
+
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+    }).addTo(map);
+
+    const accounts = L.layerGroup([
+      L.marker([52.708, -2.754]).bindPopup('Sample Account · Shrewsbury')
+    ]).addTo(map);
+
+    const leads = L.layerGroup([
+      L.marker([52.807, -2.117]).bindPopup('Sample Lead · Stafford')
+    ]).addTo(map);
+
+    const deals = L.layerGroup([
+      L.marker([52.486, -1.890]).bindPopup('Sample Deal · Birmingham')
+    ]).addTo(map);
+
+    L.control.layers({}, {
+      Accounts: accounts,
+      Leads: leads,
+      Deals: deals
+    }, { collapsed: false }).addTo(map);
+
+    map.fitBounds([
+      [52.708, -2.754],
+      [52.807, -2.117],
+      [52.486, -1.890]
+    ], { padding: [45, 45] });
+  </script>
+</body>
+</html>
