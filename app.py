@@ -6,6 +6,12 @@ import streamlit.components.v1 as components
 
 
 POSTCODE_API = "https://api.postcodes.io/postcodes"
+ZOHO_TOKEN_ERRORS = {
+    "invalid_client": "Check the Client ID and the Zoho data centre.",
+    "invalid_client_secret": "Check the Client Secret for the same Zoho Self Client.",
+    "invalid_code": "Check that you saved the current refresh_token from the token exchange.",
+    "access_denied": "Check that the Zoho user has authorised this client.",
+}
 
 
 def normalise_postcode(value):
@@ -16,24 +22,33 @@ def normalise_postcode(value):
 def load_accounts():
     config = st.secrets["zoho"]
     accounts_url = config.get("accounts_url", "https://accounts.zoho.eu")
+    token_url = f"{accounts_url.rstrip('/')}/oauth/v2/token"
 
     with requests.Session() as session:
         response = session.post(
-            f"{accounts_url.rstrip('/')}/oauth/v2/token",
+            token_url,
             data={
                 "grant_type": "refresh_token",
-                "client_id": config["client_id"],
-                "client_secret": config["client_secret"],
-                "refresh_token": config["refresh_token"],
+                "client_id": config["client_id"].strip(),
+                "client_secret": config["client_secret"].strip(),
+                "refresh_token": config["refresh_token"].strip(),
             },
             timeout=20,
         )
-        token = response.json()
+
+        try:
+            token = response.json()
+        except ValueError:
+            token = {}
+
         if not response.ok or not token.get("access_token"):
+            code = token.get("error")
+            if not isinstance(code, str) or code not in ZOHO_TOKEN_ERRORS:
+                raise RuntimeError(
+                    f"Zoho token refresh failed: unknown_error (HTTP {response.status_code})."
+                )
             raise RuntimeError(
-                "Zoho rejected the credentials. Check that the client ID, "
-                "client secret and refresh token belong to the same Zoho client "
-                "and that the Zoho data centre is correct."
+                f"Zoho token refresh failed: {code}. {ZOHO_TOKEN_ERRORS[code]}"
             )
 
         session.headers["Authorization"] = (
@@ -43,6 +58,7 @@ def load_accounts():
         params = {"fields": "Account_Name,Post_Code", "per_page": 200}
         records = {}
         page = 1
+        seen_page_tokens = set()
 
         while True:
             response = session.get(api_url, params=params, timeout=30)
@@ -50,8 +66,8 @@ def load_accounts():
                 break
             if response.status_code in (401, 403):
                 raise RuntimeError(
-                    "Zoho denied access to Accounts. Check the token's Accounts "
-                    "read scope and the Zoho user's permissions."
+                    "Zoho accepted the credentials but denied access to Accounts. "
+                    "Check the Accounts read scope and the Zoho user's permissions."
                 )
             response.raise_for_status()
             payload = response.json()
@@ -67,21 +83,24 @@ def load_accounts():
             if not info["more_records"]:
                 break
 
-            if info.get("next_page_token"):
+            next_token = info.get("next_page_token")
+            if next_token and next_token not in seen_page_tokens:
+                seen_page_tokens.add(next_token)
                 params.pop("page", None)
-                params["page_token"] = info["next_page_token"]
-            elif "page_token" not in params and page < 10:
+                params["page_token"] = next_token
+            elif not next_token and "page_token" not in params and page < 10:
                 page += 1
                 params["page"] = page
             else:
-                raise RuntimeError("Zoho did not return the next page of Accounts.")
+                raise RuntimeError("Zoho did not return a usable next page of Accounts.")
 
-    return sorted(records.values(), key=lambda item: item["name"].casefold())
+    return sorted(records.values(), key=lambda account: account["name"].casefold())
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def lookup_postcodes(postcodes):
     locations = {}
+
     for start in range(0, len(postcodes), 100):
         response = requests.post(
             POSTCODE_API,
@@ -89,13 +108,20 @@ def lookup_postcodes(postcodes):
             timeout=20,
         )
         response.raise_for_status()
+
         for match in response.json()["result"]:
             result = match.get("result")
-            if result and result.get("latitude") is not None and result.get("longitude") is not None:
+            if not result:
+                continue
+
+            latitude = result.get("latitude")
+            longitude = result.get("longitude")
+            if latitude is not None and longitude is not None:
                 locations[normalise_postcode(match["query"])] = {
                     "postcode": result["postcode"],
-                    "location": [result["latitude"], result["longitude"]],
+                    "location": [latitude, longitude],
                 }
+
     return locations
 
 
@@ -105,55 +131,76 @@ st.title("SY Comms CRM Map")
 if st.button("Refresh Zoho accounts"):
     load_accounts.clear()
 
+accounts = None
 pins = []
+
 try:
     with st.spinner("Reading Zoho Accounts…"):
         accounts = load_accounts()
 except RuntimeError as error:
     st.error(str(error))
-except (FileNotFoundError, KeyError):
-    st.error("Check that the [zoho] section and all three credentials are saved in Streamlit Secrets.")
+except FileNotFoundError:
+    st.error("Add the [zoho] section in Streamlit App settings → Secrets.")
+except KeyError:
+    st.error(
+        "Check that all three settings are present under [zoho] in Streamlit Secrets. "
+        "If they are present, Zoho returned an unexpected response."
+    )
 except (requests.RequestException, ValueError):
-    st.error("The Zoho request failed. Try Refresh Zoho accounts.")
+    st.error("The Zoho request failed. Click Refresh Zoho accounts to try again.")
 
-if "accounts" in locals():
+if accounts is not None:
     mode = st.radio(
         "Show on map",
         ["Select accounts", "All accounts"],
         horizontal=True,
     )
+
     if mode == "Select accounts":
         by_id = {account["id"]: account for account in accounts}
         labels = {
             account["id"]: f"{account['name']} ({account['postcode'] or 'no postcode'})"
             for account in accounts
         }
-        chosen = st.multiselect("Choose accounts", list(by_id), format_func=labels.get)
+        chosen = st.multiselect(
+            "Choose accounts",
+            list(by_id),
+            format_func=labels.get,
+        )
         selected = [by_id[account_id] for account_id in chosen]
     else:
         selected = accounts
 
-    postcodes = sorted({account["postcode"] for account in selected if account["postcode"]})
+    postcodes = sorted({
+        account["postcode"] for account in selected if account["postcode"]
+    })
     missing = sum(not account["postcode"] for account in selected)
 
     try:
         with st.spinner("Looking up account postcodes…"):
             locations = lookup_postcodes(postcodes)
+
         pins = [
             {"name": account["name"], **locations[account["postcode"]]}
             for account in selected
             if account["postcode"] in locations
         ]
+        not_found = len(selected) - missing - len(pins)
         st.caption(
             f"{len(accounts):,} read from Zoho · {len(selected):,} selected · "
-            f"{len(pins):,} pinned · {missing:,} missing postcode · "
-            f"{len(selected) - missing - len(pins):,} postcode not found"
+            f"{len(pins):,} accounts mapped · {missing:,} missing postcode · "
+            f"{not_found:,} postcode not found"
         )
     except (requests.RequestException, ValueError, KeyError, TypeError):
-        st.error("The account postcode lookup failed. Reload the page to retry.")
+        st.error("The account postcode lookup failed. Reload the page to try again.")
 
-# Escape HTML-sensitive characters before inserting JSON into the script.
-pins_json = json.dumps(pins).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+# Prevent CRM text from breaking out of the HTML script element.
+pins_json = (
+    json.dumps(pins)
+    .replace("<", "\\u003c")
+    .replace(">", "\\u003e")
+    .replace("&", "\\u0026")
+)
 
 MAP_HTML = r"""
 <!doctype html>
@@ -189,7 +236,7 @@ MAP_HTML = r"""
     const statusMessage = document.querySelector('#status');
 
     if (typeof L === 'undefined') {
-      statusMessage.textContent = 'The map could not load. Refresh the page to retry.';
+      statusMessage.textContent = 'The map could not load. Refresh the page to try again.';
       button.disabled = true;
     } else {
       initialiseMap();
@@ -202,7 +249,6 @@ MAP_HTML = r"""
         attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
       }).addTo(map);
 
-      // Put accounts sharing one postcode in the same popup.
       const groups = new Map();
       for (const pin of pins) {
         if (!groups.has(pin.postcode)) {
@@ -225,7 +271,10 @@ MAP_HTML = r"""
           list.append(item);
         }
         popup.append(list);
-        L.marker(group.location).bindPopup(popup, { maxHeight: 240 }).addTo(accountLayer);
+
+        L.marker(group.location)
+          .bindPopup(popup, { maxHeight: 240 })
+          .addTo(accountLayer);
       }
 
       if (groups.size) {
@@ -233,10 +282,16 @@ MAP_HTML = r"""
       }
 
       let postcodePin;
+
       form.addEventListener('submit', async (event) => {
         event.preventDefault();
+        if (button.disabled) return;
+
         const postcode = input.value.toUpperCase().replace(/\s+/g, '');
-        if (!postcode || button.disabled) return;
+        if (!postcode) {
+          statusMessage.textContent = 'Enter a UK postcode.';
+          return;
+        }
 
         button.disabled = true;
         statusMessage.textContent = 'Looking up postcode…';
@@ -248,6 +303,7 @@ MAP_HTML = r"""
             'https://api.postcodes.io/postcodes/' + encodeURIComponent(postcode),
             { signal: controller.signal }
           );
+
           if (response.status === 400 || response.status === 404) {
             statusMessage.textContent = 'Postcode not found. Check it and try again.';
             return;
@@ -261,12 +317,15 @@ MAP_HTML = r"""
           const popup = document.createElement('span');
           popup.textContent = result.postcode;
           if (postcodePin) postcodePin.remove();
+
           map.setView(location, 14);
           postcodePin = L.circleMarker(location, { radius: 10, color: '#7c3aed' })
-            .addTo(map).bindPopup(popup).openPopup();
+            .addTo(map)
+            .bindPopup(popup)
+            .openPopup();
           statusMessage.textContent = 'Showing ' + result.postcode;
         } catch {
-          statusMessage.textContent = 'Postcode lookup is unavailable. Try again shortly.';
+          statusMessage.textContent = 'The postcode lookup is unavailable. Try again shortly.';
         } finally {
           clearTimeout(timer);
           button.disabled = false;
